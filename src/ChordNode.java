@@ -49,7 +49,17 @@ public class ChordNode {
         NodeInfo closest = closestPrecedingNode(id);
         if (closest.id == self.id) return successor;
         NodeInfo result = findSuccessor(id, closest);
-        return (result != null) ? result : successor; // fall back if closest is unreachable
+        if (result == null) {
+            // Clear stale finger entry so it isn't retried
+            for (int i = 0; i < HashUtil.BITS; i++) {
+                if (fingerTable[i] != null && fingerTable[i].id == closest.id) {
+                    fingerTable[i] = null;
+                    break;
+                }
+            }
+            return successor;
+        }
+        return result;
     }
 
     // Find the closest preceding node for a given ID using the finger table
@@ -78,15 +88,19 @@ public class ChordNode {
         if (!response.payload.isEmpty()) {
             NodeInfo x = NodeInfo.deserialize(response.payload);
             if (HashUtil.inRangeExclusive(x.id, self.id, successor.id)) {
-                successor = x;
+                // Only update successor if the candidate is actually reachable
+                Message check = Client.send(x, new Message(MessageType.GET_PREDECESSOR, self, ""));
+                if (check != null) successor = x;
             }
         }
         Client.send(successor, new Message(MessageType.NOTIFY, self, ""));
 
-        // Refresh successor list from our successor's list
+        // Always track current successor as first entry
+        successorList[0] = successor;
+
+        // Fill remaining entries from successor's list
         Message slResponse = Client.send(successor, new Message(MessageType.GET_SUCCESSOR_LIST, self, ""));
         if (slResponse != null && !slResponse.payload.isEmpty()) {
-            successorList[0] = successor;
             String[] parts = slResponse.payload.split(";");
             for (int i = 0; i < SUCCESSOR_LIST_SIZE - 1 && i < parts.length; i++) {
                 successorList[i + 1] = NodeInfo.deserialize(parts[i]);
@@ -220,6 +234,10 @@ public class ChordNode {
     public void printState() {
         System.out.println("Self:        " + self);
         System.out.println("Successor:   " + successor);
+        System.out.println("Successor list:");
+        for (int i = 0; i < SUCCESSOR_LIST_SIZE; i++) {
+            System.out.println("  [" + i + "] " + successorList[i]);
+        }
         System.out.println("Predecessor: " + predecessor);
         System.out.println("Finger table:");
         for (int i = 0; i < HashUtil.BITS; i++) {
