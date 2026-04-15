@@ -6,7 +6,10 @@ public class ChordNode {
     private NodeInfo successor;
     private NodeInfo predecessor;
     private final NodeInfo[] fingerTable = new NodeInfo[HashUtil.BITS];
-    private final Map<String, String> store = new HashMap<>(); // filename -> contents
+    private final Map<String, String> store = new HashMap<>();
+
+    private static final int SUCCESSOR_LIST_SIZE = 3;
+    private final NodeInfo[] successorList = new NodeInfo[SUCCESSOR_LIST_SIZE];
 
     public ChordNode(String ip, int port) {
         int id = HashUtil.hash(ip + ":" + port);
@@ -45,7 +48,8 @@ public class ChordNode {
         }
         NodeInfo closest = closestPrecedingNode(id);
         if (closest.id == self.id) return successor;
-        return findSuccessor(id, closest);
+        NodeInfo result = findSuccessor(id, closest);
+        return (result != null) ? result : successor; // fall back if closest is unreachable
     }
 
     // Find the closest preceding node for a given ID using the finger table
@@ -61,14 +65,43 @@ public class ChordNode {
     // --- Stabilization ---
 
     public void stabilize() {
-        if (successor.id == self.id) return;
         Message response = Client.send(successor, new Message(MessageType.GET_PREDECESSOR, self, ""));
-        if (response == null || response.payload.isEmpty()) return;
-        NodeInfo x = NodeInfo.deserialize(response.payload);
-        if (HashUtil.inRangeExclusive(x.id, self.id, successor.id)) {
-            successor = x;
+        if (response == null) {
+            // Successor is unreachable — fall back to next alive in successor list
+            NodeInfo alive = nextAliveSuccessor();
+            if (alive != null && alive.id != self.id) {
+                System.out.println("Successor " + successor + " unreachable, failing over to " + alive);
+                successor = alive;
+            }
+            return;
+        }
+        if (!response.payload.isEmpty()) {
+            NodeInfo x = NodeInfo.deserialize(response.payload);
+            if (HashUtil.inRangeExclusive(x.id, self.id, successor.id)) {
+                successor = x;
+            }
         }
         Client.send(successor, new Message(MessageType.NOTIFY, self, ""));
+
+        // Refresh successor list from our successor's list
+        Message slResponse = Client.send(successor, new Message(MessageType.GET_SUCCESSOR_LIST, self, ""));
+        if (slResponse != null && !slResponse.payload.isEmpty()) {
+            successorList[0] = successor;
+            String[] parts = slResponse.payload.split(";");
+            for (int i = 0; i < SUCCESSOR_LIST_SIZE - 1 && i < parts.length; i++) {
+                successorList[i + 1] = NodeInfo.deserialize(parts[i]);
+            }
+        }
+    }
+
+    // Walk the successor list to find the first reachable node
+    private NodeInfo nextAliveSuccessor() {
+        for (NodeInfo candidate : successorList) {
+            if (candidate == null || candidate.id == self.id) continue;
+            Message response = Client.send(candidate, new Message(MessageType.GET_PREDECESSOR, self, ""));
+            if (response != null) return candidate;
+        }
+        return self;
     }
 
     public void notify(NodeInfo candidate) {
@@ -80,7 +113,8 @@ public class ChordNode {
     public void fixFingers() {
         for (int i = 0; i < HashUtil.BITS; i++) {
             int start = (self.id + (1 << i)) % HashUtil.RING_SIZE;
-            fingerTable[i] = findSuccessorLocal(start);
+            NodeInfo result = findSuccessorLocal(start);
+            if (result != null) fingerTable[i] = result; // skip update if unreachable
         }
     }
 
@@ -116,6 +150,14 @@ public class ChordNode {
             Client.send(successor, new Message(MessageType.PUT, self, entry.getKey() + ":" + entry.getValue()));
         }
         store.clear();
+        // Tell predecessor to skip over this node to our successor
+        if (predecessor != null && predecessor.id != self.id) {
+            Client.send(predecessor, new Message(MessageType.UPDATE_SUCCESSOR, self, successor.serialize()));
+        }
+        // Tell successor to update its predecessor to our predecessor
+        if (successor != null && successor.id != self.id) {
+            Client.send(successor, new Message(MessageType.UPDATE_PREDECESSOR, self, predecessor.serialize()));
+        }
         System.out.println(self + " has left the ring");
     }
 
@@ -123,6 +165,16 @@ public class ChordNode {
 
     public Message handleMessage(Message msg) {
         switch (msg.type) {
+            case GET_SUCCESSOR_LIST: {
+                StringBuilder sb = new StringBuilder();
+                for (NodeInfo n : successorList) {
+                    if (n != null) {
+                        if (sb.length() > 0) sb.append(";");
+                        sb.append(n.serialize());
+                    }
+                }
+                return new Message(MessageType.REPLY, self, sb.toString());
+            }
             case FIND_SUCCESSOR: {
                 int id = Integer.parseInt(msg.payload);
                 NodeInfo result = findSuccessorLocal(id);
@@ -138,6 +190,16 @@ public class ChordNode {
             case NOTIFY: {
                 notify(msg.sender);
                 return new Message(MessageType.REPLY, self, "");
+            }
+            case UPDATE_PREDECESSOR: {
+                predecessor = NodeInfo.deserialize(msg.payload);
+                System.out.println("Predecessor updated to " + predecessor);
+                return new Message(MessageType.REPLY, self, "OK");
+            }
+            case UPDATE_SUCCESSOR: {
+                successor = NodeInfo.deserialize(msg.payload);
+                System.out.println("Successor updated to " + successor);
+                return new Message(MessageType.REPLY, self, "OK");
             }
             case PUT: {
                 String[] parts = msg.payload.split(":", 2);
