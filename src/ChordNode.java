@@ -38,22 +38,16 @@ public class ChordNode {
 
     // Ask a remote node to find the successor of id, carrying the hop count forward
     private NodeInfo findSuccessor(int id, NodeInfo via, int hopCount) {
-        System.out.println("Routing lookup for ID " + id + " -> forwarding to " + via + " (hop " + hopCount + ")");
         Message r = Client.send(via, new Message(MessageType.FIND_SUCCESSOR, self, String.valueOf(id), hopCount));
         return (r != null) ? NodeInfo.deserialize(r.payload) : null;
     }
 
-    // Overload for callers that don't need hop count
     public NodeInfo findSuccessorLocal(int id) {
         return findSuccessorLocal(id, 0);
     }
 
-    // Find the successor of id using local state, routing outward if needed
     public NodeInfo findSuccessorLocal(int id, int hopCount) {
-        if (HashUtil.inRangeInclusive(id, self.id, successor.id)) {
-            System.out.println("Lookup for ID " + id + " resolved at " + self + " after " + hopCount + " hop(s)");
-            return successor;
-        }
+        if (HashUtil.inRangeInclusive(id, self.id, successor.id)) return successor;
         NodeInfo closest = closestPrecedingNode(id);
         if (closest.id == self.id) return successor;
         NodeInfo result = findSuccessor(id, closest, hopCount + 1);
@@ -150,8 +144,9 @@ public class ChordNode {
         NodeInfo target = findSuccessorLocal(key);
         if (target.id == self.id) {
             store.put(filename, contents);
-            System.out.println("Stored '" + filename + "' locally");
+            System.out.println("put '" + filename + "' -> stored locally");
         } else {
+            System.out.println("put '" + filename + "' -> routing to " + target);
             Client.send(target, new Message(MessageType.PUT, self, filename + ":" + contents));
         }
     }
@@ -160,6 +155,7 @@ public class ChordNode {
         int key = HashUtil.hash(filename);
         NodeInfo target = findSuccessorLocal(key);
         if (target.id == self.id) return store.getOrDefault(filename, null);
+        System.out.println("get '" + filename + "' -> routing to " + target);
         Message r = Client.send(target, new Message(MessageType.GET, self, filename));
         return (r != null) ? r.payload : null;
     }
