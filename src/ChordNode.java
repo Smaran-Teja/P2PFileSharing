@@ -5,7 +5,7 @@ public class ChordNode {
     private final NodeInfo self;
     private NodeInfo successor;
     private NodeInfo predecessor;
-    private final NodeInfo[] fingerTable  = new NodeInfo[HashUtil.BITS];
+    private final NodeInfo[] fingerTable = new NodeInfo[HashUtil.BITS];
     private final Map<String, String> store = new HashMap<>();
 
     private static final int SUCCESSOR_LIST_SIZE = 3;
@@ -19,7 +19,7 @@ public class ChordNode {
     // --- Ring initialization ---
 
     public void startRing() {
-        successor  = self;
+        successor = self;
         predecessor = self;
         successorList[0] = self;
         System.out.println("Started new ring as " + self);
@@ -29,27 +29,36 @@ public class ChordNode {
         int bootstrapId = HashUtil.hash(bootstrapIp + ":" + bootstrapPort);
         NodeInfo bootstrap = new NodeInfo(bootstrapId, bootstrapIp, bootstrapPort);
         predecessor = null;
-        successor = findSuccessor(self.id, bootstrap);
+        successor = findSuccessor(self.id, bootstrap, 0);
         successorList[0] = successor;
         System.out.println(self + " joined, successor = " + successor);
     }
 
     // --- Core routing ---
 
-    // Ask a remote node to find the successor of id
-    private NodeInfo findSuccessor(int id, NodeInfo via) {
-        Message r = Client.send(via, new Message(MessageType.FIND_SUCCESSOR, self, String.valueOf(id)));
+    // Ask a remote node to find the successor of id, carrying the hop count forward
+    private NodeInfo findSuccessor(int id, NodeInfo via, int hopCount) {
+        System.out.println("Routing lookup for ID " + id + " -> forwarding to " + via + " (hop " + hopCount + ")");
+        Message r = Client.send(via, new Message(MessageType.FIND_SUCCESSOR, self, String.valueOf(id), hopCount));
         return (r != null) ? NodeInfo.deserialize(r.payload) : null;
     }
 
-    // Find the successor of id using local state, routing outward if needed
+    // Overload for callers that don't need hop count
     public NodeInfo findSuccessorLocal(int id) {
-        if (HashUtil.inRangeInclusive(id, self.id, successor.id)) return successor;
+        return findSuccessorLocal(id, 0);
+    }
+
+    // Find the successor of id using local state, routing outward if needed
+    public NodeInfo findSuccessorLocal(int id, int hopCount) {
+        if (HashUtil.inRangeInclusive(id, self.id, successor.id)) {
+            System.out.println("Lookup for ID " + id + " resolved at " + self + " after " + hopCount + " hop(s)");
+            return successor;
+        }
         NodeInfo closest = closestPrecedingNode(id);
         if (closest.id == self.id) return successor;
-        NodeInfo result = findSuccessor(id, closest);
+        NodeInfo result = findSuccessor(id, closest, hopCount + 1);
         if (result == null) {
-            clearFingerEntry(closest.id); // remove stale finger
+            clearFingerEntry(closest.id);
             return successor;
         }
         return result;
@@ -65,16 +74,14 @@ public class ChordNode {
 
     private void clearFingerEntry(int id) {
         for (int i = 0; i < HashUtil.BITS; i++) {
-            if (fingerTable[i] != null && fingerTable[i].id == id) {
+            if (fingerTable[i] != null && fingerTable[i].id == id)
                 fingerTable[i] = null;
-            }
         }
     }
 
     // --- Stabilization ---
 
     public void stabilize() {
-        // Contact successor; fail over to successor list if unreachable
         Message response = Client.send(successor, new Message(MessageType.GET_PREDECESSOR, self, ""));
         if (response == null) {
             NodeInfo alive = nextAliveSuccessor();
@@ -85,25 +92,19 @@ public class ChordNode {
             }
             return;
         }
-
-        // If successor's predecessor is closer to us than our current successor, adopt it —
-        // but only if it is actually reachable
         if (!response.payload.isEmpty()) {
             NodeInfo x = NodeInfo.deserialize(response.payload);
             if (x.id != self.id && HashUtil.inRangeExclusive(x.id, self.id, successor.id)) {
                 Message check = Client.send(x, new Message(MessageType.GET_PREDECESSOR, self, ""));
                 if (check != null) successor = x;
-                // If x is unreachable (stale on successor), skip the update;
-                // notify() below will fix successor's predecessor
             }
         }
-
-        // Notify successor: it will update its predecessor to us if we are a better fit
-        // or if its current predecessor is dead
         Client.send(successor, new Message(MessageType.NOTIFY, self, ""));
 
-        // Refresh successor list
+        // Always track current successor as first entry
         successorList[0] = successor;
+
+        // Fill remaining entries from successor's list
         Message sl = Client.send(successor, new Message(MessageType.GET_SUCCESSOR_LIST, self, ""));
         if (sl != null && !sl.payload.isEmpty()) {
             String[] parts = sl.payload.split(";");
@@ -112,7 +113,6 @@ public class ChordNode {
         }
     }
 
-    // Called when another node thinks it might be our predecessor
     public void notify(NodeInfo candidate) {
         if (predecessor == null || predecessor.id == self.id) {
             predecessor = candidate;
@@ -122,12 +122,10 @@ public class ChordNode {
             predecessor = candidate;
             return;
         }
-        // If the range check failed but our predecessor is dead, accept the candidate
         Message check = Client.send(predecessor, new Message(MessageType.GET_PREDECESSOR, self, ""));
         if (check == null) predecessor = candidate;
     }
 
-    // Walk successor list to find the first reachable node
     private NodeInfo nextAliveSuccessor() {
         for (NodeInfo c : successorList) {
             if (c == null || c.id == self.id) continue;
@@ -186,7 +184,7 @@ public class ChordNode {
         switch (msg.type) {
             case FIND_SUCCESSOR: {
                 int id = Integer.parseInt(msg.payload);
-                return reply(findSuccessorLocal(id).serialize());
+                return reply(findSuccessorLocal(id, msg.hopCount).serialize());
             }
             case GET_PREDECESSOR:
                 return reply(predecessor != null ? predecessor.serialize() : "");
@@ -234,7 +232,7 @@ public class ChordNode {
     public void printState() {
         System.out.println("Self:        " + self);
         System.out.println("Successor:   " + successor);
-        System.out.println("Succ list:   ");
+        System.out.println("Succ list:");
         for (int i = 0; i < SUCCESSOR_LIST_SIZE; i++)
             System.out.println("  [" + i + "] " + successorList[i]);
         System.out.println("Predecessor: " + predecessor);
