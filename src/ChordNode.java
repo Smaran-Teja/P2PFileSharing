@@ -29,33 +29,53 @@ public class ChordNode {
         int bootstrapId = HashUtil.hash(bootstrapIp + ":" + bootstrapPort);
         NodeInfo bootstrap = new NodeInfo(bootstrapId, bootstrapIp, bootstrapPort);
         predecessor = null;
-        successor = findSuccessor(self.id, bootstrap, 0);
+        // Use raw send for join — hop count not needed
+        Message r = Client.send(bootstrap, new Message(MessageType.FIND_SUCCESSOR, self, String.valueOf(self.id), 0));
+        successor = (r != null) ? NodeInfo.deserialize(r.payload) : self;
         successorList[0] = successor;
         System.out.println(self + " joined, successor = " + successor);
     }
 
     // --- Core routing ---
 
-    // Ask a remote node to find the successor of id, carrying the hop count forward
-    private NodeInfo findSuccessor(int id, NodeInfo via, int hopCount) {
-        Message r = Client.send(via, new Message(MessageType.FIND_SUCCESSOR, self, String.valueOf(id), hopCount));
-        return (r != null) ? NodeInfo.deserialize(r.payload) : null;
-    }
-
+    // Used by stabilize/fixFingers — no hop tracking, returns just the node
     public NodeInfo findSuccessorLocal(int id) {
-        return findSuccessorLocal(id, 0);
-    }
-
-    public NodeInfo findSuccessorLocal(int id, int hopCount) {
         if (HashUtil.inRangeInclusive(id, self.id, successor.id)) return successor;
         NodeInfo closest = closestPrecedingNode(id);
         if (closest.id == self.id) return successor;
-        NodeInfo result = findSuccessor(id, closest, hopCount + 1);
-        if (result == null) {
-            clearFingerEntry(closest.id);
+        Message r = Client.send(closest, new Message(MessageType.FIND_SUCCESSOR, self, String.valueOf(id), 0));
+        if (r == null) { clearFingerEntry(closest.id); return successor; }
+        return NodeInfo.deserialize(r.payload);
+    }
+
+    // Used by handleMessage — resolves locally or forwards, always echoing back final hopCount
+    private Message findSuccessorAndReply(int id, int hopCount) {
+        if (HashUtil.inRangeInclusive(id, self.id, successor.id))
+            return replyWithHops(successor.serialize(), hopCount);
+        NodeInfo closest = closestPrecedingNode(id);
+        if (closest.id == self.id) return replyWithHops(successor.serialize(), hopCount);
+        // Forward to next node with incremented hop count
+        Message r = Client.send(closest, new Message(MessageType.FIND_SUCCESSOR, self, String.valueOf(id), hopCount + 1));
+        if (r == null) { clearFingerEntry(closest.id); return replyWithHops(successor.serialize(), hopCount); }
+        // Echo back the final hopCount from the deeper reply
+        return replyWithHops(r.payload, r.hopCount);
+    }
+
+    // Used by put/get — sends FIND_SUCCESSOR and reads total hops from reply
+    private NodeInfo findSuccessorTracked(int id) {
+        if (HashUtil.inRangeInclusive(id, self.id, successor.id)) {
+            System.out.println("  resolved in 0 hop(s)");
             return successor;
         }
-        return result;
+        NodeInfo closest = closestPrecedingNode(id);
+        if (closest.id == self.id) {
+            System.out.println("  resolved in 0 hop(s)");
+            return successor;
+        }
+        Message r = Client.send(closest, new Message(MessageType.FIND_SUCCESSOR, self, String.valueOf(id), 1));
+        if (r == null) { clearFingerEntry(closest.id); return successor; }
+        System.out.println("  resolved in " + r.hopCount + " hop(s)");
+        return NodeInfo.deserialize(r.payload);
     }
 
     private NodeInfo closestPrecedingNode(int id) {
@@ -95,10 +115,7 @@ public class ChordNode {
         }
         Client.send(successor, new Message(MessageType.NOTIFY, self, ""));
 
-        // Always track current successor as first entry
         successorList[0] = successor;
-
-        // Fill remaining entries from successor's list
         Message sl = Client.send(successor, new Message(MessageType.GET_SUCCESSOR_LIST, self, ""));
         if (sl != null && !sl.payload.isEmpty()) {
             String[] parts = sl.payload.split(";");
@@ -108,14 +125,8 @@ public class ChordNode {
     }
 
     public void notify(NodeInfo candidate) {
-        if (predecessor == null || predecessor.id == self.id) {
-            predecessor = candidate;
-            return;
-        }
-        if (HashUtil.inRangeExclusive(candidate.id, predecessor.id, self.id)) {
-            predecessor = candidate;
-            return;
-        }
+        if (predecessor == null || predecessor.id == self.id) { predecessor = candidate; return; }
+        if (HashUtil.inRangeExclusive(candidate.id, predecessor.id, self.id)) { predecessor = candidate; return; }
         Message check = Client.send(predecessor, new Message(MessageType.GET_PREDECESSOR, self, ""));
         if (check == null) predecessor = candidate;
     }
@@ -141,21 +152,23 @@ public class ChordNode {
 
     public void put(String filename, String contents) {
         int key = HashUtil.hash(filename);
-        NodeInfo target = findSuccessorLocal(key);
+        System.out.println("put '" + filename + "' (key=" + key + ")");
+        NodeInfo target = findSuccessorTracked(key);
         if (target.id == self.id) {
             store.put(filename, contents);
-            System.out.println("put '" + filename + "' -> stored locally");
+            System.out.println("  stored locally");
         } else {
-            System.out.println("put '" + filename + "' -> routing to " + target);
+            System.out.println("  routing to " + target);
             Client.send(target, new Message(MessageType.PUT, self, filename + ":" + contents));
         }
     }
 
     public String get(String filename) {
         int key = HashUtil.hash(filename);
-        NodeInfo target = findSuccessorLocal(key);
+        System.out.println("get '" + filename + "' (key=" + key + ")");
+        NodeInfo target = findSuccessorTracked(key);
         if (target.id == self.id) return store.getOrDefault(filename, null);
-        System.out.println("get '" + filename + "' -> routing to " + target);
+        System.out.println("  routing to " + target);
         Message r = Client.send(target, new Message(MessageType.GET, self, filename));
         return (r != null) ? r.payload : null;
     }
@@ -178,10 +191,8 @@ public class ChordNode {
 
     public Message handleMessage(Message msg) {
         switch (msg.type) {
-            case FIND_SUCCESSOR: {
-                int id = Integer.parseInt(msg.payload);
-                return reply(findSuccessorLocal(id, msg.hopCount).serialize());
-            }
+            case FIND_SUCCESSOR:
+                return findSuccessorAndReply(Integer.parseInt(msg.payload), msg.hopCount);
             case GET_PREDECESSOR:
                 return reply(predecessor != null ? predecessor.serialize() : "");
             case GET_SUCCESSOR:
@@ -221,6 +232,10 @@ public class ChordNode {
 
     private Message reply(String payload) {
         return new Message(MessageType.REPLY, self, payload);
+    }
+
+    private Message replyWithHops(String payload, int hopCount) {
+        return new Message(MessageType.REPLY, self, payload, hopCount);
     }
 
     // --- Utility ---
